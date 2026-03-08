@@ -1,0 +1,25 @@
+# SpeechScore 2.0 - Dependencies
+# Optimized for Apple Silicon (M4 Mac Pro, 48GB RAM)
+
+# ─── Core Audio Processing ───
+openai-whisper>=20231117
+torch>=2.1.0
+torchaudio>=2.1.0
+librosa>=0.10.1
+soundfile>=0.12.1
+praat-parselmouth>=0.4.3
+numpy>=1.24.0
+scipy>=1.11.0
+
+# ─── NLP & Language Analysis ───
+spacy>=3.7.0
+language-tool-python>=2.7.1
+
+# ─── Data Models & API ───
+pydantic>=2.5.0
+
+# ─── Utilities ───
+tqdm>=4.66.0
+
+# ─── Testing ───
+pytest>=7.4.0

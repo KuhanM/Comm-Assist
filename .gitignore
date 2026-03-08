@@ -1,0 +1,35 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Audio files (large binary)
+audio/*.m4a
+audio/*.wav
+audio/*.mp3
+audio/*.flac
+audio/*.ogg
+
+# Analysis output JSON (regeneratable)
+audio/*_analysis.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Whisper model cache
+*.pt
