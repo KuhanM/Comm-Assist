@@ -321,6 +321,87 @@ class CoherenceResult(BaseModel):
 
 
 # ────────────────────────────────────────────────────────────────────
+# V2 Novel: Multiscale Entropy  ⭐ NOVEL (V2-1)
+# ────────────────────────────────────────────────────────────────────
+
+class ChannelEntropySchema(BaseModel):
+    """Per-channel MSE result (Pydantic model for serialisation)."""
+    channel: str = ""
+    sample_entropy_by_scale: list[float] = Field(default_factory=list)
+    complexity_index: float = 0.0
+    ci_normalised: float = 0.0                  # 0–100
+    profile_class: str = "monotonous"
+    series_length: int = 0
+    series_std: float = 0.0
+
+
+class MultiscaleEntropySchema(BaseModel):
+    """Pydantic schema mirroring MultiscaleEntropyResult for serialisation."""
+    channels: list[ChannelEntropySchema] = Field(default_factory=list)
+    composite_complexity: float = 50.0          # 0–100
+    profile_class: str = "monotonous"
+    interpretation: str = ""
+    scales_used: int = 0
+    min_series_length: int = 0
+
+
+# ────────────────────────────────────────────────────────────────────
+# V2 Novel: Recurrence Quantification Analysis  ⭐ NOVEL (V2-2)
+# ────────────────────────────────────────────────────────────────────
+
+class ChannelRQASchema(BaseModel):
+    """Per-channel RQA result (Pydantic model for serialisation)."""
+    channel: str = ""
+    recurrence_rate: float = 0.0
+    determinism: float = 0.0
+    laminarity: float = 0.0
+    trapping_time: float = 0.0
+    max_diagonal: int = 0
+    entropy_diagonal: float = 0.0
+    n_embedded: int = 0
+    radius: float = 0.0
+
+
+class RecurrenceSchema(BaseModel):
+    """Pydantic schema mirroring RecurrenceResult for serialisation."""
+    channels: list[ChannelRQASchema] = Field(default_factory=list)
+    predictability_score: float = 50.0          # 0–100
+    consistency_score: float = 50.0             # 0–100
+    fluidity_score: float = 50.0                # 0–100
+    composite_rqa: float = 50.0                 # 0–100
+    interpretation: str = ""
+    embedding_dim: int = 2
+    delay: int = 1
+
+
+# ────────────────────────────────────────────────────────────────────
+# V2 Novel: Information-Theoretic Coherence  ⭐ NOVEL (V2-3)
+# ────────────────────────────────────────────────────────────────────
+
+class ChannelPairInfoSchema(BaseModel):
+    """Per-pair IT coherence result (Pydantic model for serialisation)."""
+    channel_x: str = ""
+    channel_y: str = ""
+    mutual_information: float = 0.0
+    normalised_mi: float = 0.0
+    transfer_entropy_x_to_y: float = 0.0
+    transfer_entropy_y_to_x: float = 0.0
+    dominant_direction: str = "none"
+    coupling_strength: str = "none"
+    series_length: int = 0
+
+
+class InfoTheoreticCoherenceSchema(BaseModel):
+    """Pydantic schema mirroring InfoTheoreticCoherenceResult for serialisation."""
+    channel_pairs: list[ChannelPairInfoSchema] = Field(default_factory=list)
+    nonlinear_coherence: float = 50.0           # 0–100
+    directional_flow: float = 50.0              # 0–100
+    composite_it_coherence: float = 50.0        # 0–100
+    interpretation: str = ""
+    k_neighbours: int = 3
+
+
+# ────────────────────────────────────────────────────────────────────
 # Listener Prediction  (Phase 2 stretch)
 # ────────────────────────────────────────────────────────────────────
 
@@ -393,6 +474,15 @@ class SpeechAnalysisResult(BaseModel):
 
     # ── Stretch: Listener Prediction ──
     listener_prediction: Optional[ListenerPrediction] = None
+
+    # ── V2 Novel: Multiscale Entropy ⭐ NOVEL ──
+    multiscale_entropy: Optional[MultiscaleEntropySchema] = None
+
+    # ── V2 Novel: Recurrence Quantification Analysis ⭐ NOVEL ──
+    recurrence_analysis: Optional[RecurrenceSchema] = None
+
+    # ── V2 Novel: Information-Theoretic Coherence ⭐ NOVEL ──
+    info_theoretic_coherence: Optional[InfoTheoreticCoherenceSchema] = None
 
     # ── Summary ──
     total_windows: int = 0

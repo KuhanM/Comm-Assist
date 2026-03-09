@@ -1,19 +1,22 @@
 """
-SpeechScore 2.0 — Composite Scoring Engine  (Day 7)
+SpeechScore 2.0 — Composite Scoring Engine  (Day 7 + V2)
 
 Takes the full SpeechAnalysisResult and produces a weighted composite
 score (0–100) with per-category sub-scores, letter grade, and summary.
 
-Category weights (from spec §5.2, normalised over 9 implemented categories):
-  Vocal Delivery     15.0%    (15/100)
-  Fluency            15.0%    (15/100)
-  Clarity            10.0%    (10/100)
-  Language           10.0%    (10/100)
-  Temporal Dynamics  15.0%    (15/100)
-  Cognitive Load      5.0%    ( 5/100)
-  Speaker-Adaptive   10.0%    (10/100)
-  Coherence          10.0%    (10/100)  ⭐ NEW
-  Listener Score     10.0%    (10/100)  ⭐ NEW
+Category weights (V2, normalised over 12 implemented categories):
+  Vocal Delivery         12.0%
+  Fluency                12.0%
+  Clarity                 8.0%
+  Language                8.0%
+  Temporal Dynamics      12.0%
+  Cognitive Load          4.0%
+  Speaker-Adaptive        8.0%
+  Coherence               8.0%
+  Listener Score          8.0%
+  Speech Complexity       8.0%    ⭐ V2-1 (MSE)
+  Speech Dynamics         6.0%    ⭐ V2-2 (RQA)
+  IT Coherence            6.0%    ⭐ V2-3 (MI+TE)
 
 Total: 100%
 """
@@ -38,15 +41,18 @@ logger = logging.getLogger(__name__)
 _W_TOTAL = 100.0
 
 CATEGORY_WEIGHTS: dict[str, float] = {
-    "vocal_delivery":    15.0 / _W_TOTAL,
-    "fluency":           15.0 / _W_TOTAL,
-    "clarity":           10.0 / _W_TOTAL,
-    "language":          10.0 / _W_TOTAL,
-    "temporal_dynamics": 15.0 / _W_TOTAL,
-    "cognitive_load":     5.0 / _W_TOTAL,
-    "speaker_adaptive":  10.0 / _W_TOTAL,
-    "coherence":         10.0 / _W_TOTAL,
-    "listener_score":    10.0 / _W_TOTAL,
+    "vocal_delivery":      12.0 / _W_TOTAL,
+    "fluency":             12.0 / _W_TOTAL,
+    "clarity":              8.0 / _W_TOTAL,
+    "language":             8.0 / _W_TOTAL,
+    "temporal_dynamics":   12.0 / _W_TOTAL,
+    "cognitive_load":       4.0 / _W_TOTAL,
+    "speaker_adaptive":     8.0 / _W_TOTAL,
+    "coherence":            8.0 / _W_TOTAL,
+    "listener_score":       8.0 / _W_TOTAL,
+    "speech_complexity":    8.0 / _W_TOTAL,   # V2-1: MSE
+    "speech_dynamics":      6.0 / _W_TOTAL,   # V2-2: RQA
+    "it_coherence":         6.0 / _W_TOTAL,   # V2-3: MI+TE
 }
 
 
@@ -301,6 +307,43 @@ def _score_listener(r: SpeechAnalysisResult) -> tuple[float, dict]:
     }
 
 
+def _score_speech_complexity(r: SpeechAnalysisResult) -> tuple[float, dict]:
+    """Speech Complexity: MSE composite (V2-1 — higher = richer dynamics)."""
+    mse = r.multiscale_entropy
+    if not mse:
+        return 50.0, {}
+
+    return mse.composite_complexity, {
+        "profile_class": mse.profile_class,
+        "scales_used": mse.scales_used,
+    }
+
+
+def _score_speech_dynamics(r: SpeechAnalysisResult) -> tuple[float, dict]:
+    """Speech Dynamics: RQA composite (V2-2 — predictability/consistency/fluidity)."""
+    rqa = r.recurrence_analysis
+    if not rqa:
+        return 50.0, {}
+
+    return rqa.composite_rqa, {
+        "predictability": round(rqa.predictability_score, 1),
+        "consistency": round(rqa.consistency_score, 1),
+        "fluidity": round(rqa.fluidity_score, 1),
+    }
+
+
+def _score_it_coherence(r: SpeechAnalysisResult) -> tuple[float, dict]:
+    """IT Coherence: MI + TE composite (V2-3 — nonlinear cross-modal coupling)."""
+    itc = r.info_theoretic_coherence
+    if not itc:
+        return 50.0, {}
+
+    return itc.composite_it_coherence, {
+        "nonlinear_coherence": round(itc.nonlinear_coherence, 1),
+        "directional_flow": round(itc.directional_flow, 1),
+    }
+
+
 # ── Grade mapping ───────────────────────────────────────────────
 
 def _grade(score: float) -> str:
@@ -364,6 +407,9 @@ _SCORERS = {
     "speaker_adaptive":  _score_adaptive,
     "coherence":         _score_coherence,
     "listener_score":    _score_listener,
+    "speech_complexity": _score_speech_complexity,
+    "speech_dynamics":   _score_speech_dynamics,
+    "it_coherence":      _score_it_coherence,
 }
 
 
