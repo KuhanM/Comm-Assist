@@ -48,6 +48,7 @@ from speechscore.analyzers.scoring import compute_composite
 from speechscore.analyzers.entropy import MultiscaleEntropyAnalyzer
 from speechscore.analyzers.recurrence import RecurrenceAnalyzer
 from speechscore.analyzers.info_theory import InfoTheoreticCoherenceAnalyzer
+from speechscore.analyzers.frame_features import extract_frame_features
 
 logger = logging.getLogger(__name__)
 
@@ -325,9 +326,15 @@ class SpeechScorePipeline:
         )
 
         # ── Step 13: Multiscale Entropy ⭐ NOVEL V2-1 ──
-        self._step("13/15 Multiscale Entropy analysis")
+        self._step("13/15 Frame-level feature extraction + Multiscale Entropy")
         t0 = time.time()
-        mse_result = self.mse_analyzer.analyze(all_wm)
+        frame_features = extract_frame_features(audio, sr)
+        logger.info(
+            "  Frame features: %d frames (%.1f s), %.0f%% voiced",
+            frame_features.n_frames, frame_features.duration_sec,
+            100 * frame_features.voiced_mask.mean() if frame_features.n_frames > 0 else 0,
+        )
+        mse_result = self.mse_analyzer.analyze(frame_features)
         result.multiscale_entropy = MultiscaleEntropySchema(
             channels=[
                 ChannelEntropySchema(
@@ -356,7 +363,7 @@ class SpeechScorePipeline:
         # ── Step 14: Recurrence Quantification Analysis ⭐ NOVEL V2-2 ──
         self._step("14/15 Recurrence Quantification Analysis")
         t0 = time.time()
-        rqa_result = self.rqa_analyzer.analyze(all_wm)
+        rqa_result = self.rqa_analyzer.analyze(frame_features)
         result.recurrence_analysis = RecurrenceSchema(
             channels=[
                 ChannelRQASchema(
@@ -390,7 +397,7 @@ class SpeechScorePipeline:
         # ── Step 15: Information-Theoretic Coherence ⭐ NOVEL V2-3 ──
         self._step("15/15 Information-Theoretic Coherence")
         t0 = time.time()
-        it_result = self.it_coherence_analyzer.analyze(all_wm)
+        it_result = self.it_coherence_analyzer.analyze(frame_features)
         result.info_theoretic_coherence = InfoTheoreticCoherenceSchema(
             channel_pairs=[
                 ChannelPairInfoSchema(

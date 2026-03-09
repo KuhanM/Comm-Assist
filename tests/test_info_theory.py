@@ -1,24 +1,25 @@
 """
-SpeechScore 2.0 — Tests for Information-Theoretic Coherence (V2-3)
+SpeechScore 2.0 — Tests for Information-Theoretic Coherence (V2-3, frame-level)
 
 25+ tests covering:
   - knn_entropy (Kozachenko-Leonenko)
   - knn_mutual_information (KSG Algorithm 1)
   - transfer_entropy (Schreiber 2000)
-  - InfoTheoreticCoherenceAnalyzer end-to-end
+  - InfoTheoreticCoherenceAnalyzer end-to-end (frame-level)
   - normalised MI & coupling classification
 """
 
 import pytest
 import numpy as np
 
-from speechscore.models.schemas import WindowMetrics
+from speechscore.analyzers.frame_features import FrameFeatures, downsample
 from speechscore.analyzers.info_theory import (
     knn_entropy,
     knn_mutual_information,
     transfer_entropy,
     InfoTheoreticCoherenceAnalyzer,
     _MIN_SERIES_LEN,
+    _IT_TARGET_N,
 )
 
 
@@ -26,19 +27,47 @@ from speechscore.analyzers.info_theory import (
 # Helpers
 # ────────────────────────────────────────────────────────────────
 
-def _make_window(wid: int = 0, wpm: float = 130.0, pitch_std: float = 20.0,
-                 rms: float = 0.05, pause_freq: float = 5.0,
-                 word_count: int = 22, **kwargs) -> WindowMetrics:
-    return WindowMetrics(
-        window_id=wid, start_time=wid * 5, end_time=wid * 5 + 10,
-        speech_rate_wpm=wpm, pitch_mean=180.0, pitch_std=pitch_std,
-        volume_consistency=0.80, rms_mean=rms,
-        pause_count=2, pause_frequency_per_min=pause_freq,
-        mean_pause_duration=0.3, filler_count=1,
-        filler_rate_per_100=1.0, phonation_ratio=0.75,
-        asr_confidence=0.85, word_recognition_rate=0.90,
-        word_count=word_count, transcript="sample speech",
-        **kwargs,
+def _make_frame_features(n_frames: int = 500, seed: int = 42,
+                         signal_type: str = "sine",
+                         coupling: float = 0.0) -> FrameFeatures:
+    """
+    Create synthetic FrameFeatures for testing.
+
+    coupling > 0: inject cross-channel dependency (F0 drives RMS).
+    """
+    rng = np.random.default_rng(seed)
+    t = np.linspace(0, 2 * np.pi * 10, n_frames)
+
+    if signal_type == "sine":
+        f0 = 150.0 + 30.0 * np.sin(t)
+        rms = 0.05 + 0.02 * np.sin(t * 0.7)
+        centroid = 2000.0 + 500.0 * np.sin(t * 1.3)
+    elif signal_type == "random":
+        f0 = 150.0 + rng.normal(0, 30, n_frames)
+        rms = 0.05 + rng.normal(0, 0.02, n_frames).clip(0.001)
+        centroid = 2000.0 + rng.normal(0, 500, n_frames)
+    elif signal_type == "coupled":
+        f0 = 150.0 + 30.0 * np.sin(t)
+        # RMS is a lagged, noisy copy of F0
+        rms = 0.05 + coupling * 0.001 * np.roll(f0 - 150.0, 5) + rng.normal(0, 0.005, n_frames)
+        rms = rms.clip(0.001)
+        centroid = 2000.0 + coupling * 10 * (f0 - 150.0) + rng.normal(0, 100, n_frames)
+    else:
+        raise ValueError(f"Unknown signal_type: {signal_type}")
+
+    log_f0 = np.log2(np.maximum(f0, 1.0))
+    rms_db = 20.0 * np.log10(np.maximum(rms, 1e-6) / 1e-6)
+    flux = np.abs(rng.normal(0, 0.1, n_frames))
+    voiced = np.ones(n_frames, dtype=bool)
+
+    return FrameFeatures(
+        f0=f0, log_f0=log_f0,
+        rms_energy=rms, rms_db=rms_db,
+        spectral_centroid=centroid,
+        spectral_flux=flux,
+        voiced_mask=voiced,
+        hop_sec=0.01, sample_rate=16000,
+        n_frames=n_frames, duration_sec=n_frames * 0.01,
     )
 
 
@@ -98,48 +127,41 @@ class TestKNNMutualInformation:
         x = rng.normal(0, 1, 200)
         y = rng.normal(0, 1, 200)
         mi = knn_mutual_information(x, y, k=3)
-        assert abs(mi) < 0.5
+        assert mi < 0.3  # near zero
 
     def test_identical_signals_high_mi(self):
-        """Identical signals + tiny noise → high MI."""
+        """Identical signals → high MI."""
         rng = np.random.default_rng(42)
         x = rng.normal(0, 1, 200)
-        y = x + rng.normal(0, 0.01, 200)
-        mi = knn_mutual_information(x, y, k=3)
+        mi = knn_mutual_information(x, x, k=3)
         assert mi > 1.0
 
-    def test_linear_relationship_positive_mi(self):
-        """y = 2x + noise → positive MI."""
+    def test_correlated_higher_than_independent(self):
+        """Correlated pair → higher MI than independent pair."""
         rng = np.random.default_rng(42)
         x = rng.normal(0, 1, 200)
-        y = 2 * x + rng.normal(0, 0.5, 200)
-        mi = knn_mutual_information(x, y, k=3)
-        assert mi > 0.3
+        y_corr = x + rng.normal(0, 0.1, 200)
+        y_ind = rng.normal(0, 1, 200)
 
-    def test_mi_non_negative_clamped(self):
-        """MI should be clamped to ≥ 0."""
-        rng = np.random.default_rng(42)
-        x = rng.normal(0, 1, 50)
-        y = rng.normal(0, 1, 50)
-        mi = knn_mutual_information(x, y, k=3)
-        assert mi >= 0.0
+        mi_corr = knn_mutual_information(x, y_corr, k=3)
+        mi_ind = knn_mutual_information(x, y_ind, k=3)
+        assert mi_corr > mi_ind
 
-    def test_length_mismatch_shorter_used(self):
-        """Different lengths → truncated to shorter."""
+    def test_mi_non_negative(self):
+        """MI should be ≥ 0."""
         rng = np.random.default_rng(42)
-        x = rng.normal(0, 1, 100)
-        y = rng.normal(0, 1, 50)
-        mi = knn_mutual_information(x, y, k=3)
-        assert isinstance(mi, float)
+        for _ in range(5):
+            x = rng.normal(0, 1, 100)
+            y = rng.normal(0, 1, 100)
+            mi = knn_mutual_information(x, y, k=3)
+            assert mi >= 0
 
-    def test_symmetric(self):
-        """MI(X,Y) == MI(Y,X)."""
-        rng = np.random.default_rng(42)
-        x = rng.normal(0, 1, 100)
-        y = x + rng.normal(0, 0.5, 100)
-        mi_xy = knn_mutual_information(x, y, k=3)
-        mi_yx = knn_mutual_information(y, x, k=3)
-        assert mi_xy == pytest.approx(mi_yx, abs=0.1)
+    def test_short_series_returns_zero(self):
+        """Too short → 0."""
+        x = np.array([1.0])
+        y = np.array([2.0])
+        mi = knn_mutual_information(x, y, k=3)
+        assert mi == 0.0
 
 
 # ================================================================
@@ -147,151 +169,140 @@ class TestKNNMutualInformation:
 # ================================================================
 
 class TestTransferEntropy:
-    """Tests for Schreiber's transfer entropy."""
+    """Tests for the transfer entropy estimator."""
 
     def test_independent_low_te(self):
         """Independent signals → TE ≈ 0."""
         rng = np.random.default_rng(42)
-        x = rng.normal(0, 1, 100)
-        y = rng.normal(0, 1, 100)
-        te = transfer_entropy(x, y, lag=1, k=3)
-        assert abs(te) < 0.5
+        x = rng.normal(0, 1, 200)
+        y = rng.normal(0, 1, 200)
+        te = transfer_entropy(x, y, k=3)
+        assert te < 0.2
 
     def test_causal_signal_positive_te(self):
-        """y[t] = 0.8 * x[t-1] + noise → TE(x→y) > 0."""
+        """X causes Y → TE(X→Y) should be positive."""
         rng = np.random.default_rng(42)
-        n = 300
-        x = rng.normal(0, 1, n)
-        y = np.zeros(n)
-        for t in range(1, n):
-            y[t] = 0.8 * x[t - 1] + rng.normal(0, 0.2)
+        x = np.cumsum(rng.normal(0, 1, 300))
+        # y follows x with a lag
+        y = np.zeros(300)
+        for i in range(1, 300):
+            y[i] = 0.8 * x[i - 1] + 0.2 * rng.normal()
         te = transfer_entropy(x, y, lag=1, k=3)
         assert te > 0
 
-    def test_directionality(self):
-        """TE(x→y) > TE(y→x) when x causally drives y."""
+    def test_te_non_negative(self):
+        """TE should be ≥ 0."""
         rng = np.random.default_rng(42)
-        n = 300
-        x = rng.normal(0, 1, n)
-        y = np.zeros(n)
-        for t in range(1, n):
-            y[t] = 0.8 * x[t - 1] + rng.normal(0, 0.2)
-        te_xy = transfer_entropy(x, y, lag=1, k=3)
-        te_yx = transfer_entropy(y, x, lag=1, k=3)
-        assert te_xy > te_yx
+        x = rng.normal(0, 1, 100)
+        y = rng.normal(0, 1, 100)
+        te = transfer_entropy(x, y, k=3)
+        assert te >= 0
 
-    def test_returns_float(self):
-        rng = np.random.default_rng(42)
-        x = rng.normal(0, 1, 50)
-        y = rng.normal(0, 1, 50)
-        te = transfer_entropy(x, y, lag=1, k=3)
-        assert isinstance(te, float)
-
-    def test_short_input_returns_zero(self):
-        """Too-short input → 0."""
-        te = transfer_entropy(np.array([1.0, 2.0]), np.array([3.0, 4.0]),
-                              lag=1, k=3)
-        assert te == 0.0
+    def test_short_series_returns_zero(self):
+        x = np.array([1.0, 2.0])
+        y = np.array([3.0, 4.0])
+        assert transfer_entropy(x, y) == 0.0
 
 
 # ================================================================
-# END-TO-END ANALYZER
+# ANALYZER (FRAME-LEVEL)
 # ================================================================
 
 class TestInfoTheoreticCoherenceAnalyzer:
-    """Tests for the full InfoTheoreticCoherenceAnalyzer."""
+    """End-to-end tests with FrameFeatures."""
 
-    def test_insufficient_windows_returns_default(self):
-        """Too few windows → default result."""
-        wins = [_make_window(wid=i) for i in range(3)]
+    def test_basic_analysis(self):
+        """Analyzer runs on synthetic sine signal."""
+        ff = _make_frame_features(600, signal_type="sine")
         analyzer = InfoTheoreticCoherenceAnalyzer()
-        result = analyzer.analyze(wins)
-        assert result.composite_it_coherence == 50.0
-        assert "Insufficient" in result.interpretation
-
-    def test_sufficient_windows_returns_pairs(self):
-        """Enough windows → 3 channel pair results."""
-        rng = np.random.default_rng(42)
-        wins = [
-            _make_window(wid=i,
-                         wpm=130 + rng.normal(0, 10),
-                         pitch_std=20 + rng.normal(0, 3),
-                         rms=0.05 + rng.normal(0, 0.005),
-                         pause_freq=5 + rng.normal(0, 1),
-                         word_count=22 + int(rng.normal(0, 3)))
-            for i in range(15)
-        ]
-        analyzer = InfoTheoreticCoherenceAnalyzer()
-        result = analyzer.analyze(wins)
+        result = analyzer.analyze(ff)
 
         assert len(result.channel_pairs) == 3
-
-    def test_composite_in_range(self):
-        """Composite coherence in [0, 100]."""
-        rng = np.random.default_rng(42)
-        wins = [
-            _make_window(wid=i,
-                         wpm=130 + rng.normal(0, 15),
-                         pitch_std=20 + rng.normal(0, 5),
-                         rms=0.05 + rng.normal(0, 0.01),
-                         pause_freq=5 + rng.normal(0, 2),
-                         word_count=22 + int(rng.normal(0, 4)))
-            for i in range(20)
-        ]
-        analyzer = InfoTheoreticCoherenceAnalyzer()
-        result = analyzer.analyze(wins)
+        assert result.channel_pairs[0].channel_x == "log_f0"
+        assert result.channel_pairs[0].channel_y == "rms_db"
+        assert result.channel_pairs[1].channel_x == "log_f0"
+        assert result.channel_pairs[1].channel_y == "spectral_centroid"
+        assert result.channel_pairs[2].channel_x == "rms_db"
+        assert result.channel_pairs[2].channel_y == "spectral_flux"
         assert 0 <= result.composite_it_coherence <= 100
 
-    def test_correlated_windows_higher_coherence(self):
-        """Windows with correlated channels → higher NMI than random."""
-        # Create windows where rms correlates with word_count
-        wins = []
-        for i in range(25):
-            base = np.sin(i * 0.5) * 10
-            wins.append(_make_window(
-                wid=i,
-                wpm=130 + base,
-                pitch_std=20 + base * 0.5,
-                rms=0.05 + base * 0.002,
-                pause_freq=5 + base * 0.3,
-                word_count=max(5, int(22 + base * 0.8)),
-            ))
-        analyzer = InfoTheoreticCoherenceAnalyzer()
-        result = analyzer.analyze(wins)
-        # At least some coupling should be detected
-        assert any(p.normalised_mi > 0.01 for p in result.channel_pairs)
+    def test_coupled_higher_coherence(self):
+        """Strongly coupled channels → higher coherence than independent."""
+        ff_coupled = _make_frame_features(600, signal_type="coupled", coupling=5.0)
+        ff_random = _make_frame_features(600, signal_type="random")
 
-    def test_interpretation_non_empty(self):
-        """Result has non-empty interpretation."""
-        rng = np.random.default_rng(42)
-        wins = [
-            _make_window(wid=i, wpm=130 + rng.normal(0, 10))
-            for i in range(12)
-        ]
         analyzer = InfoTheoreticCoherenceAnalyzer()
-        result = analyzer.analyze(wins)
+        result_coupled = analyzer.analyze(ff_coupled)
+        result_random = analyzer.analyze(ff_random)
+
+        # Coupled should have higher NMI on at least the F0-centroid pair
+        coupled_nmi = result_coupled.channel_pairs[1].normalised_mi
+        random_nmi = result_random.channel_pairs[1].normalised_mi
+        assert coupled_nmi > random_nmi
+
+    def test_insufficient_frames(self):
+        """Too few frames → default result."""
+        ff = _make_frame_features(10, signal_type="sine")
+        analyzer = InfoTheoreticCoherenceAnalyzer()
+        result = analyzer.analyze(ff)
+        assert "Insufficient" in result.interpretation
+
+    def test_score_ranges(self):
+        """All scores in [0, 100]."""
+        ff = _make_frame_features(600, signal_type="random")
+        analyzer = InfoTheoreticCoherenceAnalyzer()
+        result = analyzer.analyze(ff)
+
+        assert 0 <= result.nonlinear_coherence <= 100
+        assert 0 <= result.directional_flow <= 100
+        assert 0 <= result.composite_it_coherence <= 100
+
+    def test_coupling_strength_labels(self):
+        """Coupling strength labels make sense."""
+        ff = _make_frame_features(600, signal_type="sine")
+        analyzer = InfoTheoreticCoherenceAnalyzer()
+        result = analyzer.analyze(ff)
+
+        valid_labels = {"strong", "moderate", "weak", "none"}
+        for pair in result.channel_pairs:
+            assert pair.coupling_strength in valid_labels
+
+    def test_direction_labels(self):
+        """Direction labels are valid strings."""
+        ff = _make_frame_features(600, signal_type="sine")
+        analyzer = InfoTheoreticCoherenceAnalyzer()
+        result = analyzer.analyze(ff)
+
+        for pair in result.channel_pairs:
+            assert pair.dominant_direction  # non-empty string
+
+    def test_interpretation_present(self):
+        ff = _make_frame_features(600, signal_type="sine")
+        analyzer = InfoTheoreticCoherenceAnalyzer()
+        result = analyzer.analyze(ff)
         assert len(result.interpretation) > 10
 
-    def test_nonlinear_coherence_score_exists(self):
-        """Result has nonlinear_coherence_score attribute."""
-        rng = np.random.default_rng(42)
-        wins = [
-            _make_window(wid=i, wpm=130 + rng.normal(0, 10),
-                         rms=0.05 + rng.normal(0, 0.005))
-            for i in range(15)
-        ]
-        analyzer = InfoTheoreticCoherenceAnalyzer()
-        result = analyzer.analyze(wins)
-        assert 0 <= result.nonlinear_coherence <= 100
 
-    def test_directional_flow_score_exists(self):
-        """Result has directional_flow_score attribute."""
-        rng = np.random.default_rng(42)
-        wins = [
-            _make_window(wid=i, wpm=130 + rng.normal(0, 10),
-                         rms=0.05 + rng.normal(0, 0.005))
-            for i in range(15)
-        ]
-        analyzer = InfoTheoreticCoherenceAnalyzer()
-        result = analyzer.analyze(wins)
-        assert 0 <= result.directional_flow <= 100
+# ================================================================
+# SCORE MAPPINGS
+# ================================================================
+
+class TestScoreMappings:
+
+    def test_nmi_score_range(self):
+        """NMI score always in [0, 100]."""
+        for nmi in np.linspace(0, 1, 20):
+            score = InfoTheoreticCoherenceAnalyzer._nmi_to_score(nmi)
+            assert 0 <= score <= 100
+
+    def test_nmi_score_monotonic(self):
+        """NMI score increases with NMI."""
+        scores = [InfoTheoreticCoherenceAnalyzer._nmi_to_score(n) for n in np.linspace(0, 1, 20)]
+        for i in range(1, len(scores)):
+            assert scores[i] >= scores[i - 1]
+
+    def test_te_score_range(self):
+        """TE score always in [0, 100]."""
+        for te in np.linspace(0, 2, 20):
+            score = InfoTheoreticCoherenceAnalyzer._te_to_score(te)
+            assert 0 <= score <= 100

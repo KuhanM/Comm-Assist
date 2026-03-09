@@ -80,14 +80,15 @@ import numpy as np
 from scipy.special import digamma
 from scipy.spatial import KDTree
 
-from speechscore.models.schemas import WindowMetrics, TranscriptionResult
+from speechscore.analyzers.frame_features import FrameFeatures, downsample
 
 logger = logging.getLogger(__name__)
 
 # ── Algorithm parameters ────────────────────────────────────────
 _DEFAULT_K = 3           # k for KNN-based MI estimation (Kraskov 2004)
-_MIN_SERIES_LEN = 10     # minimum data points for reliable MI
+_MIN_SERIES_LEN = 50     # minimum frames after downsampling
 _TE_LAG = 1              # time lag for transfer entropy
+_IT_TARGET_N = 1000      # downsample target for KSG MI/TE
 
 
 # ── Data classes ────────────────────────────────────────────────
@@ -288,44 +289,21 @@ def transfer_entropy(source: np.ndarray, target: np.ndarray,
 
 
 # ────────────────────────────────────────────────────────────────
-# VADER sentiment extraction (per-window)
-# ────────────────────────────────────────────────────────────────
-
-def _extract_per_window_sentiment(windows: list[WindowMetrics]
-                                  ) -> list[float]:
-    """
-    Compute VADER compound sentiment for each window's transcript.
-
-    Returns list of sentiment values ∈ [−1, +1].
-    """
-    try:
-        from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-        analyzer = SentimentIntensityAnalyzer()
-        sentiments = []
-        for w in windows:
-            text = w.transcript.strip() if w.transcript else ""
-            if text:
-                sentiments.append(analyzer.polarity_scores(text)["compound"])
-            else:
-                sentiments.append(0.0)
-        return sentiments
-    except ImportError:
-        logger.warning("vaderSentiment not available; returning zeros")
-        return [0.0] * len(windows)
-
-
-# ────────────────────────────────────────────────────────────────
 # Main analyzer
 # ────────────────────────────────────────────────────────────────
+
 
 class InfoTheoreticCoherenceAnalyzer:
     """
     Information-Theoretic Cross-Modal Coherence Analysis.
 
-    Analyses three channel pairs:
-      1. **Energy ↔ Sentiment** — does vocal force track emotional content?
-      2. **Pitch variability ↔ Speech rate** — are prosodic dimensions coupled?
-      3. **Pause frequency ↔ Complexity** — do pauses align with cognitive demands?
+    Analyses three **frame-level** prosodic channel pairs:
+      1. **F0 ↔ RMS energy** — pitch–loudness coupling
+      2. **F0 ↔ spectral centroid** — pitch–brightness coupling
+      3. **RMS ↔ spectral flux** — energy–articulatory-change coupling
+
+    All channels operate at 10 ms resolution (N ≈ 1000 after
+    downsampling), giving reliable KSG-based MI/TE estimation.
 
     For each pair, computes:
       - Mutual Information (MI) — total statistical dependency
@@ -335,50 +313,45 @@ class InfoTheoreticCoherenceAnalyzer:
     Usage::
 
         analyzer = InfoTheoreticCoherenceAnalyzer()
-        result = analyzer.analyze(window_metrics)
+        result = analyzer.analyze(frame_features)
     """
 
     def __init__(self, k: int = _DEFAULT_K) -> None:
         self.k = k
 
-    def analyze(self, windows: list[WindowMetrics]
+    def analyze(self, features: FrameFeatures
                 ) -> InfoTheoreticCoherenceResult:
         """
-        Compute IT coherence for all channel pairs.
+        Compute IT coherence for frame-level prosodic channel pairs.
 
         Parameters
         ----------
-        windows : per-window metrics from Phase 1.
+        features : FrameFeatures from raw audio at 10 ms hop.
 
         Returns
         -------
         InfoTheoreticCoherenceResult
         """
-        if len(windows) < _MIN_SERIES_LEN:
+        if features.n_frames < _MIN_SERIES_LEN:
             logger.warning(
-                "IT Coherence: only %d windows (need %d) — returning default",
-                len(windows), _MIN_SERIES_LEN,
+                "IT Coherence: only %d frames (need %d) — returning default",
+                features.n_frames, _MIN_SERIES_LEN,
             )
             return InfoTheoreticCoherenceResult(
-                interpretation="Insufficient windows for information-theoretic analysis.",
+                interpretation="Insufficient audio frames for information-theoretic analysis.",
             )
 
-        # Extract per-window series
-        energy = np.array([w.rms_mean or 0.0 for w in windows])
-        pitch_var = np.array([w.pitch_std or 0.0 for w in windows])
-        speech_rate = np.array([w.speech_rate_wpm or 0.0 for w in windows])
-        pause_freq = np.array([w.pause_frequency_per_min or 0.0 for w in windows])
-        sentiment = np.array(_extract_per_window_sentiment(windows))
+        # Downsample all channels to target N
+        f0 = downsample(features.log_f0, _IT_TARGET_N)
+        rms = downsample(features.rms_db, _IT_TARGET_N)
+        centroid = downsample(features.spectral_centroid, _IT_TARGET_N)
+        flux = downsample(features.spectral_flux, _IT_TARGET_N)
 
-        # Estimate per-window sentence complexity from word count as proxy
-        # (More words in a fixed window → denser, more complex content)
-        word_density = np.array([w.word_count for w in windows], dtype=np.float64)
-
-        # Define channel pairs
+        # Frame-level cross-modal pairs
         pairs_def = [
-            ("energy", "sentiment", energy, sentiment),
-            ("pitch_variability", "speech_rate", pitch_var, speech_rate),
-            ("pause_frequency", "word_density", pause_freq, word_density),
+            ("log_f0", "rms_db", f0, rms),
+            ("log_f0", "spectral_centroid", f0, centroid),
+            ("rms_db", "spectral_flux", rms, flux),
         ]
 
         pair_results: list[ChannelPairInfo] = []
@@ -436,13 +409,11 @@ class InfoTheoreticCoherenceAnalyzer:
             ))
             nmi_values.append(nmi)
 
-            # TE asymmetry as a signal of structured information flow
             max_te = max(te_xy, te_yx)
             te_asymmetries.append(max_te)
 
         # Composite scores
-        # NMI → coherence score: higher NMI = more cross-modal coupling (good)
-        # Weighted: energy-sentiment 40%, pitch-rate 35%, pause-complexity 25%
+        # Weighted: F0-RMS 40%, F0-centroid 35%, RMS-flux 25%
         w = [0.40, 0.35, 0.25]
 
         nonlinear_coherence = sum(
@@ -450,7 +421,6 @@ class InfoTheoreticCoherenceAnalyzer:
             for wi, nmi in zip(w, nmi_values)
         )
 
-        # TE → directional flow score: any TE > 0 is structured flow (good)
         directional_flow = sum(
             wi * self._te_to_score(te)
             for wi, te in zip(w, te_asymmetries)

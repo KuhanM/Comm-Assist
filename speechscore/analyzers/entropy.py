@@ -74,7 +74,7 @@ from typing import Optional
 import numpy as np
 from scipy import stats
 
-from speechscore.models.schemas import WindowMetrics
+from speechscore.analyzers.frame_features import FrameFeatures, downsample
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +84,9 @@ logger = logging.getLogger(__name__)
 #   r = 0.15–0.25 × SD  (tolerance; 0.2 is standard)
 _DEFAULT_M = 2          # embedding dimension
 _DEFAULT_R_FRAC = 0.20  # tolerance as fraction of series SD
-_MAX_SCALE = 5          # max coarse-graining scale (for ~20 windows)
-_MIN_SERIES_LEN = 8     # minimum data points to compute SampEn
+_MAX_SCALE = 20         # max coarse-graining scale (Costa et al. recommend 20)
+_MIN_SERIES_LEN = 50    # minimum frames after downsampling
+_MSE_TARGET_N = 750     # downsample target for O(N²) SampEn
 
 
 # ── Data classes for results ────────────────────────────────────
@@ -119,7 +120,11 @@ class MultiscaleEntropyResult:
 
 def _count_matches(x: np.ndarray, m: int, r: float) -> tuple[int, int]:
     """
-    Count template matches for SampEn computation.
+    Count template matches for SampEn computation (vectorized).
+
+    Uses NumPy broadcasting to compute all pairwise Chebyshev
+    distances in a single pass, giving ~100x speedup over the
+    scalar double-loop for N > 200.
 
     Parameters
     ----------
@@ -137,19 +142,25 @@ def _count_matches(x: np.ndarray, m: int, r: float) -> tuple[int, int]:
     if N < m + 2:
         return 0, 0
 
-    B = 0  # matches of length m
-    A = 0  # matches of length m+1
+    n = N - m  # number of length-m templates
 
-    for i in range(N - m):
-        for j in range(i + 1, N - m):
-            # Check if templates of length m match
-            # Chebyshev distance (max absolute difference)
-            if np.max(np.abs(x[i:i + m] - x[j:j + m])) <= r:
-                B += 1
-                # If also matching at length m+1
-                if i + m < N and j + m < N:
-                    if abs(x[i + m] - x[j + m]) <= r:
-                        A += 1
+    # Build template matrix: templates[i] = [x[i], ..., x[i+m-1]]
+    idx = np.arange(n)[:, None] + np.arange(m)
+    templates = x[idx]  # (n, m)
+
+    # Chebyshev distance between all template pairs
+    diff = np.abs(templates[:, None, :] - templates[None, :, :])  # (n, n, m)
+    chebyshev = np.max(diff, axis=2)  # (n, n)
+
+    # Upper triangle (i < j) — avoid self-matches and double-counting
+    mask_upper = np.triu(np.ones((n, n), dtype=bool), k=1)
+    match_m = (chebyshev <= r) & mask_upper
+    B = int(match_m.sum())
+
+    # A: pairs also matching at length m+1
+    next_vals = x[m:m + n]
+    next_dist = np.abs(next_vals[:, None] - next_vals[None, :])
+    A = int((match_m & (next_dist <= r)).sum())
 
     return B, A
 
@@ -327,22 +338,26 @@ def _classify_profile(profile: list[float]) -> str:
 
 class MultiscaleEntropyAnalyzer:
     """
-    Multiscale Entropy (MSE) analysis of speech dynamics.
+    Multiscale Entropy (MSE) analysis of frame-level speech dynamics.
 
-    Analyses three speech channels:
-      1. **Pitch stability** (per-window F0 SD) — vocal control entropy
-      2. **Speech rate** (per-window WPM) — pacing entropy
-      3. **Energy** (per-window RMS) — delivery dynamics entropy
+    Analyses three prosodic contours extracted at 10 ms resolution:
+      1. **log₂(F0)** — pitch contour on octave scale
+      2. **RMS (dB)** — energy contour
+      3. **Spectral centroid** — brightness contour (Hz)
 
-    Each channel yields an MSE profile, a Complexity Index, and a
-    profile classification.  The composite score uses an
-    **inverted-U mapping**: optimal speech has *intermediate*
-    complexity (not too erratic, not too monotonous).
+    Each contour is down-sampled to ~750 points (block averaging)
+    to keep O(N²) SampEn tractable, then analysed across 20 coarse-
+    graining scales.  Each channel yields an MSE profile, a
+    Complexity Index (CI), and a profile classification.
+
+    The composite score uses an **inverted-U mapping**: optimal
+    speech has *intermediate* complexity — engaging variety
+    without chaos.
 
     Usage::
 
         analyzer = MultiscaleEntropyAnalyzer()
-        result = analyzer.analyze(window_metrics)
+        result = analyzer.analyze(frame_features)
     """
 
     def __init__(self, max_scale: int = _MAX_SCALE, m: int = _DEFAULT_M,
@@ -351,54 +366,51 @@ class MultiscaleEntropyAnalyzer:
         self.m = m
         self.r_frac = r_frac
 
-    def analyze(self, windows: list[WindowMetrics]) -> MultiscaleEntropyResult:
+    def analyze(self, features: FrameFeatures) -> MultiscaleEntropyResult:
         """
-        Compute MSE analysis for all speech channels.
+        Compute MSE analysis on frame-level prosodic contours.
 
         Parameters
         ----------
-        windows : per-window metrics from Phase 1.
+        features : FrameFeatures extracted from raw audio at 10 ms hop.
 
         Returns
         -------
         MultiscaleEntropyResult
         """
-        if len(windows) < _MIN_SERIES_LEN:
+        if features.n_frames < _MIN_SERIES_LEN:
             logger.warning(
-                "MSE: only %d windows (need %d) — returning default",
-                len(windows), _MIN_SERIES_LEN,
+                "MSE: only %d frames (need %d) — returning default",
+                features.n_frames, _MIN_SERIES_LEN,
             )
             return MultiscaleEntropyResult(
-                interpretation="Insufficient windows for entropy analysis.",
-                min_series_length=len(windows),
+                interpretation="Insufficient audio frames for entropy analysis.",
+                min_series_length=features.n_frames,
             )
 
-        # Extract time series for each channel
+        # Frame-level contours — genuine time series at 10 ms resolution
         channels_def = [
-            ("pitch_variability", [w.pitch_std or 0.0 for w in windows]),
-            ("speech_rate", [w.speech_rate_wpm or 0.0 for w in windows]),
-            ("energy", [w.rms_mean or 0.0 for w in windows]),
+            ("log_f0", features.log_f0),              # pitch (octave scale)
+            ("rms_db", features.rms_db),               # energy (dB)
+            ("spectral_centroid", features.spectral_centroid),  # brightness
         ]
 
         channel_results: list[ChannelEntropy] = []
         composite_parts: list[float] = []
         profile_classes: list[str] = []
 
-        for name, series in channels_def:
-            arr = np.array(series, dtype=np.float64)
+        for name, raw_series in channels_def:
+            # Downsample to target N for O(N²) SampEn
+            arr = downsample(raw_series, _MSE_TARGET_N)
 
             # Compute MSE profile
-            r = self.r_frac * np.std(arr, ddof=1) if np.std(arr, ddof=1) > 1e-10 else None
+            sd = np.std(arr, ddof=1)
+            r = self.r_frac * sd if sd > 1e-10 else None
             mse = multiscale_entropy(arr, max_scale=self.max_scale,
                                      m=self.m, r=r)
             ci = complexity_index(mse)
 
-            # Normalise CI to [0, 100] using inverted-U:
-            #   optimal CI is "moderate" — penalise both extremes.
-            #   Empirically, CI for 20 windows of speech ≈ 0.5–4.0.
-            #   Map: CI = 2.0 → score 100; CI < 0.3 or CI > 5.0 → score 0.
             ci_norm = self._inverted_u_score(ci)
-
             pclass = _classify_profile(mse)
 
             channel_results.append(ChannelEntropy(
@@ -408,12 +420,12 @@ class MultiscaleEntropyAnalyzer:
                 ci_normalised=round(ci_norm, 1),
                 profile_class=pclass,
                 series_length=len(arr),
-                series_std=round(float(np.std(arr, ddof=1)), 4),
+                series_std=round(float(sd), 4),
             ))
             composite_parts.append(ci_norm)
             profile_classes.append(pclass)
 
-        # Composite: weighted mean (pitch 40%, rate 35%, energy 25%)
+        # Composite: weighted mean (F0 40%, energy 35%, centroid 25%)
         weights = [0.40, 0.35, 0.25]
         composite = sum(w * s for w, s in zip(weights, composite_parts))
 
@@ -429,7 +441,7 @@ class MultiscaleEntropyAnalyzer:
             profile_class=dominant,
             interpretation=interpretation,
             scales_used=len(channel_results[0].sample_entropy_by_scale) if channel_results else 0,
-            min_series_length=min(len(s) for _, s in channels_def),
+            min_series_length=min(ch.series_length for ch in channel_results),
         )
 
     @staticmethod
@@ -440,12 +452,16 @@ class MultiscaleEntropyAnalyzer:
         Optimal complexity is moderate — too low (monotonous) or
         too high (chaotic) are both penalised.
 
-        The mapping uses a Gaussian-like bell curve:
+        The mapping uses a Gaussian bell curve:
           score = 100 × exp(−((CI − μ) / σ)²)
-        with μ = 1.8 (optimal CI), σ = 1.5 (width).
+        µ = 15.0  — optimal CI for N≈750, 20 scales.
+        σ = 10.0  — width for frame-level speech data.
+
+        NOTE: these parameters require empirical calibration on
+        labelled speech corpora.
         """
-        mu = 1.8   # optimal CI for ~20-window speech
-        sigma = 1.5
+        mu = 15.0   # optimal CI for frame-level speech (750 pts, 20 scales)
+        sigma = 10.0
         return float(100.0 * np.exp(-((ci - mu) / sigma) ** 2))
 
     @staticmethod

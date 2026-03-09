@@ -77,18 +77,22 @@ from dataclasses import dataclass, field
 import numpy as np
 from scipy.spatial.distance import cdist
 
-from speechscore.models.schemas import WindowMetrics
+from speechscore.analyzers.frame_features import (
+    FrameFeatures, downsample, optimal_delay_ami, optimal_dimension_fnn,
+)
 
 logger = logging.getLogger(__name__)
 
 # ── Algorithm parameters ────────────────────────────────────────
-# Canonical RQA choices (Marwan et al. 2007):
-_DEFAULT_EMBED_DIM = 2       # embedding dimension m
-_DEFAULT_DELAY = 1           # time delay τ (1 for window-level data)
-_DEFAULT_RADIUS_FRAC = 0.25  # recurrence threshold ε as fraction of max distance
+# Embedding defaults used when data-driven selection fails:
+_DEFAULT_EMBED_DIM = 3       # embedding dimension m (typical for speech)
+_DEFAULT_DELAY = 1           # time delay τ (fallback)
+_DEFAULT_RADIUS_FRAC = 0.10  # recurrence threshold ε as fraction of max distance
+_TARGET_RR = 0.05            # target recurrence rate for fixed-RR ε (Marwan 2007)
 _DEFAULT_L_MIN = 2           # minimum diagonal line length for DET
 _DEFAULT_V_MIN = 2           # minimum vertical line length for LAM
-_MIN_SERIES_LEN = 8          # minimum windows needed
+_MIN_SERIES_LEN = 50         # minimum frames after downsampling
+_RQA_TARGET_N = 500          # downsample target for O(N²) distance matrix
 
 
 # ── Data classes ────────────────────────────────────────────────
@@ -360,59 +364,61 @@ def compute_rqa(x: np.ndarray,
 
 class RecurrenceAnalyzer:
     """
-    Recurrence Quantification Analysis (RQA) of speech dynamics.
+    Recurrence Quantification Analysis (RQA) of frame-level speech.
 
-    Analyses three speech channels:
-      1. **Pitch variability** (F0 SD per window) — vocal control dynamics
-      2. **Speech rate** (WPM per window) — pacing dynamics
-      3. **Energy** (RMS per window) — delivery energy dynamics
+    Analyses three prosodic contours at 10 ms resolution:
+      1. **log₂(F0)** — pitch dynamics
+      2. **RMS (dB)** — energy dynamics
+      3. **Spectral centroid** — brightness dynamics
 
-    Each channel is embedded in phase space (Takens' theorem) and
-    analysed via RQA.  The four RQA measures map to interpretable
-    speech quality dimensions:
+    Each contour is down-sampled to ~500 points, then embedded in
+    phase space with **data-driven** parameters:
+      • τ via Average Mutual Information (Fraser & Swinney 1986)
+      • m via False Nearest Neighbours (Kennel et al. 1992)
 
-      - **Predictability** (DET) — structured, deterministic delivery
-      - **Consistency** (RR) — speaker returns to similar patterns
-      - **Fluidity** (1 − LAM) — avoids "getting stuck" in monotony
+    This gives a genuine Takens reconstruction of the attractor
+    geometry from a 1-D measurement.  Four RQA measures map to
+    interpretable speech quality dimensions:
+
+      • **Predictability** (DET) — structured, deterministic delivery
+      • **Consistency** (RR) — speaker returns to similar patterns
+      • **Fluidity** (1 − LAM) — avoids “getting stuck” in monotony
 
     Usage::
 
         analyzer = RecurrenceAnalyzer()
-        result = analyzer.analyze(window_metrics)
+        result = analyzer.analyze(frame_features)
     """
 
-    def __init__(self, m: int = _DEFAULT_EMBED_DIM,
-                 tau: int = _DEFAULT_DELAY,
-                 radius_frac: float = _DEFAULT_RADIUS_FRAC) -> None:
-        self.m = m
-        self.tau = tau
+    def __init__(self, radius_frac: float = _DEFAULT_RADIUS_FRAC) -> None:
         self.radius_frac = radius_frac
 
-    def analyze(self, windows: list[WindowMetrics]) -> RecurrenceResult:
+    def analyze(self, features: FrameFeatures) -> RecurrenceResult:
         """
-        Run RQA on all speech channels.
+        Run RQA on frame-level prosodic contours.
 
         Parameters
         ----------
-        windows : per-window metrics from Phase 1.
+        features : FrameFeatures from raw audio at 10 ms hop.
 
         Returns
         -------
         RecurrenceResult
         """
-        if len(windows) < _MIN_SERIES_LEN:
+        if features.n_frames < _MIN_SERIES_LEN:
             logger.warning(
-                "RQA: only %d windows (need %d) — returning default",
-                len(windows), _MIN_SERIES_LEN,
+                "RQA: only %d frames (need %d) — returning default",
+                features.n_frames, _MIN_SERIES_LEN,
             )
             return RecurrenceResult(
-                interpretation="Insufficient windows for recurrence analysis.",
+                interpretation="Insufficient audio frames for recurrence analysis.",
             )
 
+        # Frame-level contours
         channels_def = [
-            ("pitch_variability", [w.pitch_std or 0.0 for w in windows]),
-            ("speech_rate", [w.speech_rate_wpm or 0.0 for w in windows]),
-            ("energy", [w.rms_mean or 0.0 for w in windows]),
+            ("log_f0", features.log_f0),
+            ("rms_db", features.rms_db),
+            ("spectral_centroid", features.spectral_centroid),
         ]
 
         channel_results: list[ChannelRQA] = []
@@ -420,9 +426,16 @@ class RecurrenceAnalyzer:
         all_rr: list[float] = []
         all_lam: list[float] = []
 
-        for name, series in channels_def:
-            arr = np.array(series, dtype=np.float64)
-            rqa = compute_rqa(arr, m=self.m, tau=self.tau,
+        for name, raw_series in channels_def:
+            # Downsample for O(N²) distance matrix
+            arr = downsample(raw_series, _RQA_TARGET_N)
+
+            # Data-driven embedding parameters
+            tau = optimal_delay_ami(arr, max_lag=min(50, len(arr) // 4))
+            m = optimal_dimension_fnn(arr, tau, max_dim=8)
+            logger.info("RQA %s: τ=%d, m=%d (N=%d)", name, tau, m, len(arr))
+
+            rqa = compute_rqa(arr, m=m, tau=tau,
                               radius_frac=self.radius_frac)
 
             channel_results.append(ChannelRQA(
@@ -440,24 +453,18 @@ class RecurrenceAnalyzer:
             all_rr.append(rqa["RR"])
             all_lam.append(rqa["LAM"])
 
-        # Composite scores (weighted: pitch 40%, rate 35%, energy 25%)
+        # Composite scores (weighted: F0 40%, energy 35%, centroid 25%)
         w = [0.40, 0.35, 0.25]
 
-        # Predictability: DET mapped to 0–100 (higher DET = more predictable)
-        # Optimal: moderate-to-high DET (0.5–0.9)
         pred_raw = sum(wi * d for wi, d in zip(w, all_det))
         predictability = self._det_to_score(pred_raw)
 
-        # Consistency: RR mapped to 0–100 via inverted-U
-        # Moderate RR is best (returns to patterns without being stuck)
         cons_raw = sum(wi * r for wi, r in zip(w, all_rr))
         consistency = self._rr_to_score(cons_raw)
 
-        # Fluidity: inverse of LAM (low laminarity = fluid transitions)
         lam_raw = sum(wi * la for wi, la in zip(w, all_lam))
         fluidity = self._lam_to_score(lam_raw)
 
-        # Overall: balanced combination
         composite = 0.40 * predictability + 0.30 * consistency + 0.30 * fluidity
 
         interpretation = self._interpret(predictability, consistency,
@@ -470,8 +477,8 @@ class RecurrenceAnalyzer:
             fluidity_score=round(fluidity, 1),
             composite_rqa=round(composite, 1),
             interpretation=interpretation,
-            embedding_dim=self.m,
-            delay=self.tau,
+            embedding_dim=0,   # per-channel (data-driven)
+            delay=0,           # per-channel (data-driven)
         )
 
     @staticmethod
