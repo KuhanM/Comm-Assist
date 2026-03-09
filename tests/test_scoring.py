@@ -285,9 +285,9 @@ class TestCompositeScore:
         poor = compute_composite(_poor_result())
         assert good.composite_score > poor.composite_score
 
-    def test_nine_categories(self):
+    def test_twelve_categories(self):
         result = compute_composite(_good_result())
-        assert len(result.category_scores) == 9
+        assert len(result.category_scores) == 12
 
     def test_weights_sum_to_one(self):
         total = sum(CATEGORY_WEIGHTS.values())
@@ -300,6 +300,7 @@ class TestCompositeScore:
             "vocal_delivery", "fluency", "clarity", "language",
             "temporal_dynamics", "cognitive_load", "speaker_adaptive",
             "coherence", "listener_score",
+            "speech_complexity", "speech_dynamics", "it_coherence",
         }
         assert names == expected
 
@@ -379,7 +380,8 @@ class TestCategoryScores:
         """Category scores include sub-metric detail breakdown."""
         result = compute_composite(_good_result())
         # coherence/listener return empty details when not populated on result
-        skip = {"language", "coherence", "listener_score"}
+        skip = {"language", "coherence", "listener_score",
+                "speech_complexity", "speech_dynamics", "it_coherence"}
         for cs in result.category_scores:
             if cs.category not in skip:
                 assert len(cs.details) > 0

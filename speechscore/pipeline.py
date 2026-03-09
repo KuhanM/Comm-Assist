@@ -25,6 +25,12 @@ from speechscore.config.settings import SpeechScoreConfig
 from speechscore.models.schemas import (
     SpeechAnalysisResult,
     WindowMetrics,
+    MultiscaleEntropySchema,
+    ChannelEntropySchema,
+    RecurrenceSchema,
+    ChannelRQASchema,
+    InfoTheoreticCoherenceSchema,
+    ChannelPairInfoSchema,
 )
 from speechscore.utils.audio_utils import load_audio, get_duration, create_windows
 from speechscore.analyzers.transcription import WhisperTranscriber
@@ -39,6 +45,10 @@ from speechscore.analyzers.cognitive import CognitiveAnalyzer
 from speechscore.analyzers.coherence import CoherenceAnalyzer
 from speechscore.analyzers.listener import ListenerPredictor
 from speechscore.analyzers.scoring import compute_composite
+from speechscore.analyzers.entropy import MultiscaleEntropyAnalyzer
+from speechscore.analyzers.recurrence import RecurrenceAnalyzer
+from speechscore.analyzers.info_theory import InfoTheoreticCoherenceAnalyzer
+from speechscore.analyzers.frame_features import extract_frame_features
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +87,9 @@ class SpeechScorePipeline:
         self.cognitive = CognitiveAnalyzer()
         self.coherence = CoherenceAnalyzer()
         self.listener = ListenerPredictor()
+        self.mse_analyzer = MultiscaleEntropyAnalyzer()
+        self.rqa_analyzer = RecurrenceAnalyzer()
+        self.it_coherence_analyzer = InfoTheoreticCoherenceAnalyzer()
 
         self._initialised = False
 
@@ -289,7 +302,7 @@ class SpeechScorePipeline:
         )
 
         # ── Step 11: multi-modal coherence ⭐ NOVEL ──
-        self._step("11/12 Multi-modal coherence analysis")
+        self._step("11/15 Multi-modal coherence analysis")
         t0 = time.time()
         coh = self.coherence.analyze(all_wm, transcription)
         result.coherence = coh
@@ -301,7 +314,7 @@ class SpeechScorePipeline:
         )
 
         # ── Step 12: listener prediction ──
-        self._step("12/12 Listener prediction")
+        self._step("12/15 Listener prediction")
         t0 = time.time()
         lp = self.listener.predict(result)
         result.listener_prediction = lp
@@ -310,6 +323,106 @@ class SpeechScorePipeline:
             lp.comprehension, lp.engagement, lp.trust,
             lp.retention, lp.attention_sustainability,
             lp.overall_listener_score, time.time() - t0,
+        )
+
+        # ── Step 13: Multiscale Entropy ⭐ NOVEL V2-1 ──
+        self._step("13/15 Frame-level feature extraction + Multiscale Entropy")
+        t0 = time.time()
+        frame_features = extract_frame_features(audio, sr)
+        logger.info(
+            "  Frame features: %d frames (%.1f s), %.0f%% voiced",
+            frame_features.n_frames, frame_features.duration_sec,
+            100 * frame_features.voiced_mask.mean() if frame_features.n_frames > 0 else 0,
+        )
+        mse_result = self.mse_analyzer.analyze(frame_features)
+        result.multiscale_entropy = MultiscaleEntropySchema(
+            channels=[
+                ChannelEntropySchema(
+                    channel=ch.channel,
+                    sample_entropy_by_scale=ch.sample_entropy_by_scale,
+                    complexity_index=ch.complexity_index,
+                    ci_normalised=ch.ci_normalised,
+                    profile_class=ch.profile_class,
+                    series_length=ch.series_length,
+                    series_std=ch.series_std,
+                )
+                for ch in mse_result.channels
+            ],
+            composite_complexity=mse_result.composite_complexity,
+            profile_class=mse_result.profile_class,
+            interpretation=mse_result.interpretation,
+            scales_used=mse_result.scales_used,
+            min_series_length=mse_result.min_series_length,
+        )
+        logger.info(
+            "  composite=%.1f/100, profile=%s (%.1f s)",
+            mse_result.composite_complexity, mse_result.profile_class,
+            time.time() - t0,
+        )
+
+        # ── Step 14: Recurrence Quantification Analysis ⭐ NOVEL V2-2 ──
+        self._step("14/15 Recurrence Quantification Analysis")
+        t0 = time.time()
+        rqa_result = self.rqa_analyzer.analyze(frame_features)
+        result.recurrence_analysis = RecurrenceSchema(
+            channels=[
+                ChannelRQASchema(
+                    channel=ch.channel,
+                    recurrence_rate=ch.recurrence_rate,
+                    determinism=ch.determinism,
+                    laminarity=ch.laminarity,
+                    trapping_time=ch.trapping_time,
+                    max_diagonal=ch.max_diagonal,
+                    entropy_diagonal=ch.entropy_diagonal,
+                    n_embedded=ch.n_embedded,
+                    radius=ch.radius,
+                )
+                for ch in rqa_result.channels
+            ],
+            predictability_score=rqa_result.predictability_score,
+            consistency_score=rqa_result.consistency_score,
+            fluidity_score=rqa_result.fluidity_score,
+            composite_rqa=rqa_result.composite_rqa,
+            interpretation=rqa_result.interpretation,
+            embedding_dim=rqa_result.embedding_dim,
+            delay=rqa_result.delay,
+        )
+        logger.info(
+            "  pred=%.1f, consist=%.1f, fluid=%.1f → composite=%.1f/100 (%.1f s)",
+            rqa_result.predictability_score, rqa_result.consistency_score,
+            rqa_result.fluidity_score, rqa_result.composite_rqa,
+            time.time() - t0,
+        )
+
+        # ── Step 15: Information-Theoretic Coherence ⭐ NOVEL V2-3 ──
+        self._step("15/15 Information-Theoretic Coherence")
+        t0 = time.time()
+        it_result = self.it_coherence_analyzer.analyze(frame_features)
+        result.info_theoretic_coherence = InfoTheoreticCoherenceSchema(
+            channel_pairs=[
+                ChannelPairInfoSchema(
+                    channel_x=p.channel_x,
+                    channel_y=p.channel_y,
+                    mutual_information=p.mutual_information,
+                    normalised_mi=p.normalised_mi,
+                    transfer_entropy_x_to_y=p.transfer_entropy_x_to_y,
+                    transfer_entropy_y_to_x=p.transfer_entropy_y_to_x,
+                    dominant_direction=p.dominant_direction,
+                    coupling_strength=p.coupling_strength,
+                    series_length=p.series_length,
+                )
+                for p in it_result.channel_pairs
+            ],
+            nonlinear_coherence=it_result.nonlinear_coherence,
+            directional_flow=it_result.directional_flow,
+            composite_it_coherence=it_result.composite_it_coherence,
+            interpretation=it_result.interpretation,
+            k_neighbours=it_result.k_neighbours,
+        )
+        logger.info(
+            "  NL-coh=%.1f, dir-flow=%.1f → composite=%.1f/100 (%.1f s)",
+            it_result.nonlinear_coherence, it_result.directional_flow,
+            it_result.composite_it_coherence, time.time() - t0,
         )
 
         # ── Composite scoring (Day 7) ──
@@ -427,5 +540,22 @@ class SpeechScorePipeline:
                         lp.overall_listener_score,
                         lp.comprehension, lp.engagement, lp.trust,
                         lp.retention, lp.attention_sustainability)
+
+        mse = r.multiscale_entropy
+        if mse:
+            logger.info("MSE complexity : %.1f/100 (profile=%s, scales=%d)",
+                        mse.composite_complexity, mse.profile_class, mse.scales_used)
+
+        rqa = r.recurrence_analysis
+        if rqa:
+            logger.info("RQA dynamics   : %.1f/100 (pred=%.1f, consist=%.1f, fluid=%.1f)",
+                        rqa.composite_rqa, rqa.predictability_score,
+                        rqa.consistency_score, rqa.fluidity_score)
+
+        itc = r.info_theoretic_coherence
+        if itc:
+            logger.info("IT coherence   : %.1f/100 (NL-coh=%.1f, dir-flow=%.1f)",
+                        itc.composite_it_coherence,
+                        itc.nonlinear_coherence, itc.directional_flow)
 
         logger.info("=" * 60)

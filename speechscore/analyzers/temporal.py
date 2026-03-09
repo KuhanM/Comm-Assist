@@ -346,7 +346,10 @@ class TemporalAnalyzer:
             elif fdir == "change":
                 if abs(cohens_d) > _MEDIUM_EFFECT and p_val < _ALPHA:
                     is_degraded = True
-                elif small_sample and abs(cohens_d) > _MEDIUM_EFFECT:
+                elif small_sample and abs(cohens_d) > 0.8:
+                    # Require *large* effect for undirected metrics in
+                    # small samples — medium shifts toward the optimal
+                    # range (e.g. WPM 107→120) are improvement, not fatigue.
                     is_degraded = True
 
             if is_degraded:

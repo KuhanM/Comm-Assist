@@ -60,13 +60,20 @@ _WEIGHTS = {
     "clarity_strain":      0.20,   # ASR confidence drop → articulatory strain
 }
 
-# Default struggle-point threshold (lowered from 60 → 40 for sensitivity)
-_DEFAULT_THRESHOLD = 40.0
+# Default struggle-point threshold for aggregate CSI
+_DEFAULT_THRESHOLD = 25.0
+
+# Top-2 indicator pair threshold — detects *focused* strain on 1-2
+# dimensions even when the weighted-average CSI stays low because the
+# other 4 indicators are near zero.  Set to 70 so that at least TWO
+# indicators must be clearly elevated (e.g. both at 70+, or one at 100
+# and the other at 40+).
+_DEFAULT_PEAK_PAIR_THRESHOLD = 70.0
 
 # Scaling constants — map raw deviations to 0–100.
-# These are conservative so that a z=2 deviation ≈ 70 and z=3 ≈ 90.
+# z=1 deviation ≈ 48, z=1.5 ≈ 81, z=2 ≈ 95.
 _SCALE_K = 30.0   # sensitivity (higher = steeper curve)
-_SCALE_MID = 1.5  # z-score at which indicator reaches ~50
+_SCALE_MID = 1.0  # z-score at which indicator reaches ~50
 
 
 class CognitiveAnalyzer:
@@ -79,8 +86,13 @@ class CognitiveAnalyzer:
         result = analyzer.analyze(window_metrics, baseline)
     """
 
-    def __init__(self, threshold: float = _DEFAULT_THRESHOLD) -> None:
+    def __init__(
+        self,
+        threshold: float = _DEFAULT_THRESHOLD,
+        peak_pair_threshold: float = _DEFAULT_PEAK_PAIR_THRESHOLD,
+    ) -> None:
         self.threshold = threshold
+        self.peak_pair_threshold = peak_pair_threshold
 
     def analyze(
         self,
@@ -121,7 +133,14 @@ class CognitiveAnalyzer:
                 indicator_accum[name].append(val)
 
             # struggle-point detection
-            if csi > self.threshold:
+            # Two complementary triggers:
+            #   (a) aggregate CSI exceeds threshold → broad strain, OR
+            #   (b) the average of the two highest indicators exceeds
+            #       peak_pair_threshold → focused strain on 1-2 dimensions
+            #       that the weighted average dilutes.
+            top2 = sorted(indicators.values(), reverse=True)[:2]
+            top2_avg = float(np.mean(top2))
+            if csi > self.threshold or top2_avg >= self.peak_pair_threshold:
                 primary = max(indicators, key=lambda k: indicators[k])
                 struggle_points.append(StrugglePoint(
                     window_id=w.window_id,

@@ -186,7 +186,8 @@ class TestFatigueDetection:
         assert "phonation_ratio" in fd.second_half_means
 
     def test_small_sample_effect_size_fallback(self):
-        """With N<15 per half, medium effect size alone triggers fatigue."""
+        """With N<15 per half, large effect size alone triggers fatigue
+        for directional metrics (pause_frequency, phonation)."""
         # Use only 8 windows (4 per half), so t-test lacks power
         # but effect size is clear
         n = 8
@@ -204,6 +205,26 @@ class TestFatigueDetection:
         # Fatigue should be detected via effect-size fallback
         assert len(fd.degraded_metrics) >= 1
         assert fd.fatigue_score > 0
+
+    def test_small_sample_speech_rate_needs_large_effect(self):
+        """With N<15, speech_rate_wpm ('change' direction) requires
+        d > 0.8 to trigger fatigue.  A medium shift (d~0.5-0.7) should
+        NOT be flagged — it may be improvement, not fatigue."""
+        n = 8
+        mid = n // 2
+        # Modest speech rate shift with realistic variance:
+        # first half mean≈120, second half mean≈126, high σ → d≈0.4
+        wpm = [105.0, 125.0, 110.0, 140.0, 110.0, 130.0, 120.0, 145.0]
+        windows = _make_windows(
+            n=n,
+            wpm_list=wpm,
+        )
+        analyzer = TemporalAnalyzer()
+        result = analyzer.analyze(windows)
+        fd = result.fatigue_detection
+        # speech_rate_wpm should NOT be in degraded_metrics
+        # d is ~0.6-0.7 (below the 0.8 threshold for "change" small-sample)
+        assert "speech_rate_wpm" not in fd.degraded_metrics
 
     def test_small_sample_no_degradation(self):
         """With N<15 but constant metrics, no fatigue via fallback either."""

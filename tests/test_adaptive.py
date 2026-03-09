@@ -378,3 +378,56 @@ class TestWinsorization:
         # All z-scores near 0 → should be unaffected
         for am in result.adaptive_metrics:
             assert abs(am.z_score) < 3.0
+
+
+# ================================================================
+# DIRECTION-AWARE COMPOSITE
+# ================================================================
+
+class TestDirectionAwareComposite:
+    """Tests for direction-aware adaptive composite scoring."""
+
+    def test_improvement_scores_higher_than_degradation(self):
+        """When metrics improve (e.g. fewer fillers, lower F0 SD),
+        composite should be higher than when they degrade by the same amount."""
+        scorer = AdaptiveScorer()
+        extractor = BaselineExtractor()
+
+        # Baseline: moderate values
+        baseline_wins = _make_windows(
+            6,
+            wpm_values=[130]*6,
+            pitch_std_values=[30]*6,
+            filler_rate_values=[4.0]*6,
+            phonation_values=[0.60]*6,
+        )
+        baseline = extractor.extract(baseline_wins)
+
+        # Improved: lower F0 SD, fewer fillers, more phonation
+        improved = _make_windows(
+            12,
+            pitch_std_values=[30]*6 + [20]*6,
+            filler_rate_values=[4.0]*6 + [1.0]*6,
+            phonation_values=[0.60]*6 + [0.80]*6,
+        )
+        result_good = scorer.score(improved, baseline)
+
+        # Degraded: higher F0 SD, more fillers, less phonation
+        degraded = _make_windows(
+            12,
+            pitch_std_values=[30]*6 + [40]*6,
+            filler_rate_values=[4.0]*6 + [7.0]*6,
+            phonation_values=[0.60]*6 + [0.40]*6,
+        )
+        result_bad = scorer.score(degraded, baseline)
+
+        assert result_good.overall_adaptive_score > result_bad.overall_adaptive_score
+
+    def test_neutral_metric_symmetric(self):
+        """Neutral metrics (speech rate, volume) should penalise
+        equally in both directions."""
+        scorer = AdaptiveScorer()
+        # z-scores: neutral metric with same |z| in opposite directions
+        score_pos = scorer._composite_score([1.5], [None])  # +1.5
+        score_neg = scorer._composite_score([-1.5], [None])  # -1.5
+        assert abs(score_pos - score_neg) < 1.0  # effectively identical
