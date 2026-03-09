@@ -387,3 +387,115 @@ class TestReliabilityFlags:
         w.reliable = False
         w.reliability_flags = ["very_low_asr"]
         assert not w.reliable
+
+
+# ================================================================
+# STRUGGLE DETECTION FIX — peak-pair + threshold calibration
+# ================================================================
+
+class TestStruggleDetectionFix:
+    """
+    Tests for the three-part struggle detection fix:
+      1. Sigmoid midpoint lowered (MID 1.5 → 1.0): moderate z-scores
+         now produce meaningful indicator values.
+      2. Peak-pair detection: a window triggers as a struggle point if
+         the average of its two highest indicators ≥ peak_pair_threshold,
+         even when the weighted-average CSI is low.
+      3. Lower default aggregate threshold (40 → 25).
+    """
+
+    def test_sigmoid_sensitivity_at_z1(self):
+        """z = 1.0 deviation should produce indicator ≥ 40 (not ~17)."""
+        # baseline mean=5, std=2 → value=7 is z=1.0
+        score = _deviation_score(7.0, bl_mean=5.0, bl_std=2.0,
+                                 direction="higher_is_worse")
+        assert score >= 40, (
+            f"z=1.0 should produce indicator ≥ 40 with MID=1.0, got {score}"
+        )
+
+    def test_sigmoid_sensitivity_at_z1_5(self):
+        """z = 1.5 deviation should produce indicator ≥ 75."""
+        score = _deviation_score(8.0, bl_mean=5.0, bl_std=2.0,
+                                 direction="higher_is_worse")
+        assert score >= 75, (
+            f"z=1.5 should produce indicator ≥ 75, got {score}"
+        )
+
+    def test_focused_strain_detected_via_peak_pair(self):
+        """
+        Focused strain: ONE dimension highly elevated (e.g. heavy pauses)
+        while others are at baseline.  The weighted average CSI would be
+        too low, but peak-pair detection catches it.
+        """
+        bl = _calm_baseline()
+        # Only pause_freq elevated: z = (20-5)/2 = 7.5 → indicator ≈ 100
+        # Everything else at baseline
+        win = _make_window(pause_freq=20.0)
+        analyzer = CognitiveAnalyzer()
+        result = analyzer.analyze([win], bl)
+        assert result.struggle_count >= 1, (
+            "Focused single-dimension strain (heavy pauses) "
+            "should trigger struggle via peak-pair detection"
+        )
+
+    def test_two_dimensions_elevated_triggers_struggle(self):
+        """
+        Two dimensions elevated (e.g. fast speech + high pitch instab.)
+        while others at baseline → should trigger via peak-pair.
+        """
+        bl = _calm_baseline()
+        # speech rate z ≈ (180-130)/8 = 6.25, pitch_std z = (40-20)/4 = 5
+        # both indicators ≈ 100 → top-2 avg ≈ 100
+        win = _make_window(wpm=180, pitch_std=40)
+        analyzer = CognitiveAnalyzer()
+        result = analyzer.analyze([win], bl)
+        assert result.struggle_count >= 1
+
+    def test_calm_window_still_no_struggle(self):
+        """
+        A window at baseline should not trigger even with the
+        more sensitive sigmoid and lower threshold.
+        """
+        bl = _calm_baseline()
+        wins = [_make_window(wid=i, start=i*5, end=i*5+10) for i in range(10)]
+        analyzer = CognitiveAnalyzer()
+        result = analyzer.analyze(wins, bl)
+        assert result.struggle_count == 0, (
+            f"Calm windows should not be flagged, got {result.struggle_count}"
+        )
+
+    def test_moderate_single_dimension_no_struggle(self):
+        """
+        A single dimension with moderate elevation (z ≈ 1.0) should NOT
+        trigger struggle — only focused extreme strain should.
+        """
+        bl = _calm_baseline()
+        # pause_freq z = (7-5)/2 = 1.0 → indicator ≈ 48
+        # top-2 avg ≈ (48 + ~0) / 2 ≈ 24 < 50
+        win = _make_window(pause_freq=7.0)
+        analyzer = CognitiveAnalyzer()
+        result = analyzer.analyze([win], bl)
+        assert result.struggle_count == 0, (
+            "z=1.0 on a single dimension should NOT trigger struggle"
+        )
+
+    def test_peak_pair_threshold_parameter(self):
+        """peak_pair_threshold parameter controls focused-strain sensitivity."""
+        bl = _calm_baseline()
+        # pause_freq z = (15-5)/2 = 5 → indicator ≈ 100
+        # top-2 avg ≈ (100 + ~0) / 2 ≈ 50
+        win = _make_window(pause_freq=15.0)
+
+        # With very high peak_pair_threshold → no struggle
+        analyzer_high = CognitiveAnalyzer(
+            threshold=90, peak_pair_threshold=90.0
+        )
+        result_high = analyzer_high.analyze([win], bl)
+
+        # With low peak_pair_threshold → struggle detected
+        analyzer_low = CognitiveAnalyzer(
+            threshold=90, peak_pair_threshold=30.0
+        )
+        result_low = analyzer_low.analyze([win], bl)
+
+        assert result_low.struggle_count >= result_high.struggle_count

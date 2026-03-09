@@ -175,6 +175,7 @@ class AdaptiveScorer:
 
         adaptive_metrics: list[AdaptiveMetricScore] = []
         z_scores: list[float] = []
+        z_directions: list[Optional[bool]] = []  # higher_is_better for each
 
         for mdef in _METRIC_DEFS:
             name = mdef["name"]
@@ -208,13 +209,14 @@ class AdaptiveScorer:
             )
             adaptive_metrics.append(am)
             z_scores.append(float(z))
+            z_directions.append(mdef["higher_is_better"])
 
         # ── Winsorize z-scores at ±3 to prevent single outliers
         # from dominating the composite score ──
         z_scores_w = [float(np.clip(z, -3.0, 3.0)) for z in z_scores]
 
-        # ── Composite scores ──
-        overall = self._composite_score(z_scores_w)
+        # ── Composite scores (direction-aware) ──
+        overall = self._composite_score(z_scores_w, z_directions)
 
         # speech-rate delta (% change from baseline)
         sr_global = global_means.get("speech_rate_wpm", 0.0)
@@ -266,27 +268,53 @@ class AdaptiveScorer:
         return result
 
     @staticmethod
-    def _composite_score(z_scores: list[float]) -> float:
+    def _composite_score(
+        z_scores: list[float],
+        directions: list[Optional[bool]] | None = None,
+    ) -> float:
         """
         Map a vector of z-scores to a 0–100 composite score.
 
-        Uses a sigmoid-like activation so that:
-          - z ≈ 0 → score ≈ 75  (typical = good)
-          - z ≈ ±1 → score ≈ 60
-          - z ≈ ±2 → score ≈ 35
-          - z ≈ ±3 → score ≈ 15
+        Direction-aware: when higher_is_better is known, a z-score
+        in the "good" direction (e.g. fewer fillers, more phonation)
+        is treated as only 30% of the deviation.  Degradations remain
+        fully penalised.  Neutral metrics (higher_is_better=None) use
+        |z| as before.
 
-        The score rewards *consistency* with the speaker's own baseline.
-        Moderate deviations are not heavily penalised; extreme ones are.
+        Targets:
+          - effective_z ≈ 0   → score ≈ 75  (typical = good)
+          - effective_z ≈ ±1  → score ≈ 60
+          - effective_z ≈ ±2  → score ≈ 35
+          - effective_z ≈ ±3  → score ≈ 15
         """
         if not z_scores:
             return 50.0
 
-        # Mean absolute z across all metrics
-        mean_abs_z = float(np.mean(np.abs(z_scores)))
+        if directions is None:
+            directions = [None] * len(z_scores)
 
-        # Sigmoid-like mapping: score = 100 / (1 + exp(k * (|z| − shift)))
+        effective: list[float] = []
+        for z, hib in zip(z_scores, directions):
+            if hib is None:
+                # Neutral — any deviation counts fully
+                effective.append(abs(z))
+            elif hib is True:
+                # Higher is better: positive z = improvement → dampen
+                if z >= 0:
+                    effective.append(abs(z) * 0.3)  # improvement
+                else:
+                    effective.append(abs(z))          # degradation
+            else:
+                # Lower is better: negative z = improvement → dampen
+                if z <= 0:
+                    effective.append(abs(z) * 0.3)  # improvement
+                else:
+                    effective.append(abs(z))          # degradation
+
+        mean_eff = float(np.mean(effective))
+
+        # Sigmoid-like mapping: score = 100 / (1 + exp(k * (eff − shift)))
         # k=1.5, shift=0.5 → typical performance scores ~75+
-        score = 100.0 / (1.0 + np.exp(1.5 * (mean_abs_z - 0.5)))
+        score = 100.0 / (1.0 + np.exp(1.5 * (mean_eff - 0.5)))
 
         return float(np.clip(score, 0.0, 100.0))

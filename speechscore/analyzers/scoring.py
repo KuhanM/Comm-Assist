@@ -250,8 +250,8 @@ def _score_cognitive(r: SpeechAnalysisResult) -> tuple[float, dict]:
     # Lower CSI = better
     s_csi = max(0.0, 100.0 - cs.mean_csi)
 
-    # Fewer struggle points = better (5% struggle → 75 score)
-    s_struggle = max(0.0, 100.0 - cs.struggle_pct * 5.0)
+    # Fewer struggle points = better (25% struggle → 50 score)
+    s_struggle = max(0.0, 100.0 - cs.struggle_pct * 2.0)
 
     score = s_csi * 0.6 + s_struggle * 0.4
     return score, {
